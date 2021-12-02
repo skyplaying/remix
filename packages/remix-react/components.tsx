@@ -272,7 +272,7 @@ export function RemixRoute({ id }: { id: string }) {
     // This needs to run after we check for the error from a previous render,
     // otherwise we will incorrectly render this boundary for a loader error
     // deeper in the tree.
-    if (componentDidCatchEmulator.trackCatchBoundaries) {
+    if (!componentDidCatchEmulator.catch) {
       componentDidCatchEmulator.catchBoundaryRouteId = id;
     }
 
