@@ -1,4 +1,4 @@
-import { useFetcher } from "remix";
+import { Form, useFetcher } from "remix";
 
 export const action = () => {
   throw new Error("Whoops!");
@@ -12,9 +12,9 @@ export default function Component() {
       <fetcher.Form method="post">
         <button type="submit">Submit fetcher form</button>
       </fetcher.Form>
-      <form method="post">
+      <Form method="post">
         <button type="submit">Submit regular form</button>
-      </form>
+      </Form>
     </div>
   );
 }

@@ -48,6 +48,7 @@ export interface ComponentDidCatchEmulator {
   // `null` means the app layout threw before any routes rendered
   renderBoundaryRouteId: string | null;
   trackBoundaries: boolean;
+  trackCatchBoundaries: boolean;
 }
 
 export interface ThrownResponse<T = any> {

@@ -190,6 +190,7 @@ async function renderDocumentRequest({
 
   let appState: ComponentDidCatchEmulator = {
     trackBoundaries: true,
+    trackCatchBoundaries: true,
     catchBoundaryRouteId: null,
     renderBoundaryRouteId: null,
     loaderBoundaryRouteId: null,
@@ -199,12 +200,14 @@ async function renderDocumentRequest({
 
   if (!isValidRequestMethod(request)) {
     matches = null;
+    appState.trackCatchBoundaries = false;
     appState.catch = {
       data: null,
       status: 405,
       statusText: "Method Not Allowed"
     };
   } else if (!matches) {
+    appState.trackCatchBoundaries = false;
     appState.catch = {
       data: null,
       status: 404,
@@ -241,6 +244,7 @@ async function renderDocumentRequest({
           matches,
           "CatchBoundary"
         );
+        appState.trackCatchBoundaries = false;
         appState.catch = {
           ...actionStatus,
           data: await extractData(actionResponse)
@@ -368,6 +372,7 @@ async function renderDocumentRequest({
 
       if (isCatch) {
         // If it's a catch response, store it in app state, and bail
+        appState.trackCatchBoundaries = false;
         appState.catch = {
           data: await extractData(response),
           status: response.status,
@@ -385,8 +390,10 @@ async function renderDocumentRequest({
   // boundaries as they are probably deeper in the tree if the action
   // initially triggered a boundary as that match would not exist in the
   // matches to load.
-  if (!appState.catch && !appState.error) {
+  if (!appState.catch) {
     appState.catchBoundaryRouteId = actionCatchBoundaryRouteId;
+  }
+  if (!appState.error) {
     appState.loaderBoundaryRouteId = actionLoaderBoundaryRouteId;
   }
   // If there was an action error or catch, we will reset the state to the

@@ -272,19 +272,9 @@ export function RemixRoute({ id }: { id: string }) {
     // This needs to run after we check for the error from a previous render,
     // otherwise we will incorrectly render this boundary for a loader error
     // deeper in the tree.
-    if (!componentDidCatchEmulator.catch) {
+    if (componentDidCatchEmulator.trackCatchBoundaries) {
       componentDidCatchEmulator.catchBoundaryRouteId = id;
     }
-
-    context = maybeServerCaught
-      ? {
-          id,
-          get data() {
-            console.error("You cannot `useLoaderData` in a catch boundary.");
-            return undefined;
-          }
-        }
-      : { id, data };
 
     element = (
       <RemixCatchBoundary
@@ -327,16 +317,6 @@ export function RemixRoute({ id }: { id: string }) {
     if (componentDidCatchEmulator.trackBoundaries) {
       componentDidCatchEmulator.renderBoundaryRouteId = id;
     }
-
-    context = maybeServerRenderError
-      ? {
-          id,
-          get data() {
-            console.error("You cannot `useLoaderData` in an error boundary.");
-            return undefined;
-          }
-        }
-      : { id, data };
 
     element = (
       <RemixErrorBoundary
