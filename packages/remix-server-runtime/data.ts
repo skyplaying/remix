@@ -1,87 +1,54 @@
-import type { Params } from "react-router";
-
-import type { ServerBuild } from "./build";
-import { json } from "./responses";
+import {
+  redirect,
+  json,
+  isDeferredData,
+  isResponse,
+  isRedirectStatusCode,
+} from "./responses";
+import type {
+  ActionFunction,
+  ActionFunctionArgs,
+  LoaderFunction,
+  LoaderFunctionArgs,
+} from "./routeModules";
 
 /**
- * An object of arbitrary for route loaders and actions provided by the
- * server's `getLoadContext()` function.
+ * An object of unknown type for route loaders and actions provided by the
+ * server's `getLoadContext()` function.  This is defined as an empty interface
+ * specifically so apps can leverage declaration merging to augment this type
+ * globally: https://www.typescriptlang.org/docs/handbook/declaration-merging.html
  */
-export type AppLoadContext = any;
+export interface AppLoadContext {
+  [key: string]: unknown;
+}
 
 /**
  * Data for a route that was returned from a `loader()`.
  */
-export type AppData = any;
+export type AppData = unknown;
 
-export async function loadRouteData(
-  build: ServerBuild,
-  routeId: string,
-  request: Request,
-  context: AppLoadContext,
-  params: Params
-): Promise<Response> {
-  let routeModule = build.routes[routeId].module;
-
-  if (!routeModule.loader) {
-    return Promise.resolve(json(null));
-  }
-
-  let result;
-
-  try {
-    result = await routeModule.loader({ request, context, params });
-  } catch (error) {
-    if (!isResponse(error)) {
-      throw error;
-    }
-
-    if (!isRedirectResponse(error)) {
-      error.headers.set("X-Remix-Catch", "yes");
-    }
-    result = error;
-  }
-
-  if (result === undefined) {
-    throw new Error(
-      `You defined a loader for route "${routeId}" but didn't return ` +
-        `anything from your \`loader\` function. Please return a value or \`null\`.`
-    );
-  }
-
-  return isResponse(result) ? result : json(result);
-}
-
-export async function callRouteAction(
-  build: ServerBuild,
-  routeId: string,
-  request: Request,
-  context: AppLoadContext,
-  params: Params
-): Promise<Response> {
-  let routeModule = build.routes[routeId].module;
-
-  if (!routeModule.action) {
-    throw new Error(
-      `You made a ${request.method} request to ${request.url} but did not provide ` +
-        `an \`action\` for route "${routeId}", so there is no way to handle the ` +
-        `request.`
-    );
-  }
-
-  let result;
-  try {
-    result = await routeModule.action({ request, context, params });
-  } catch (error) {
-    if (!isResponse(error)) {
-      throw error;
-    }
-
-    if (!isRedirectResponse(error)) {
-      error.headers.set("X-Remix-Catch", "yes");
-    }
-    result = error;
-  }
+export async function callRouteAction({
+  loadContext,
+  action,
+  params,
+  request,
+  routeId,
+  singleFetch,
+}: {
+  request: Request;
+  action: ActionFunction;
+  params: ActionFunctionArgs["params"];
+  loadContext: AppLoadContext;
+  routeId: string;
+  singleFetch: boolean;
+}) {
+  let result = await action({
+    request: singleFetch
+      ? stripRoutesParam(stripIndexParam(request))
+      : stripDataParam(stripIndexParam(request)),
+    context: loadContext,
+    params,
+  });
 
   if (result === undefined) {
     throw new Error(
@@ -90,41 +57,125 @@ export async function callRouteAction(
     );
   }
 
+  // Allow naked object returns when single fetch is enabled
+  if (singleFetch) {
+    return result;
+  }
+
   return isResponse(result) ? result : json(result);
 }
 
-export function isCatchResponse(value: any) {
-  return isResponse(value) && value.headers.get("X-Remix-Catch") != null;
-}
+export async function callRouteLoader({
+  loadContext,
+  loader,
+  params,
+  request,
+  routeId,
+  singleFetch,
+}: {
+  request: Request;
+  loader: LoaderFunction;
+  params: LoaderFunctionArgs["params"];
+  loadContext: AppLoadContext;
+  routeId: string;
+  singleFetch: boolean;
+}) {
+  let result = await loader({
+    request: singleFetch
+      ? stripRoutesParam(stripIndexParam(request))
+      : stripDataParam(stripIndexParam(request)),
+    context: loadContext,
+    params,
+  });
 
-function isResponse(value: any): value is Response {
-  return (
-    value != null &&
-    typeof value.status === "number" &&
-    typeof value.statusText === "string" &&
-    typeof value.headers === "object" &&
-    typeof value.body !== "undefined"
-  );
-}
-
-const redirectStatusCodes = new Set([301, 302, 303, 307, 308]);
-
-export function isRedirectResponse(response: Response): boolean {
-  return redirectStatusCodes.has(response.status);
-}
-
-export function extractData(response: Response): Promise<AppData> {
-  let contentType = response.headers.get("Content-Type");
-
-  if (contentType && /\bapplication\/json\b/.test(contentType)) {
-    return response.json();
+  if (result === undefined) {
+    throw new Error(
+      `You defined a loader for route "${routeId}" but didn't return ` +
+        `anything from your \`loader\` function. Please return a value or \`null\`.`
+    );
   }
 
-  // What other data types do we need to handle here? What other kinds of
-  // responses are people going to be returning from their loaders?
-  // - application/x-www-form-urlencoded ?
-  // - multipart/form-data ?
-  // - binary (audio/video) ?
+  if (isDeferredData(result)) {
+    if (result.init && isRedirectStatusCode(result.init.status || 200)) {
+      return redirect(
+        new Headers(result.init.headers).get("Location")!,
+        result.init
+      );
+    }
+    return result;
+  }
 
-  return response.text();
+  // Allow naked object returns when single fetch is enabled
+  if (singleFetch) {
+    return result;
+  }
+
+  return isResponse(result) ? result : json(result);
+}
+
+// TODO: Document these search params better
+// and stop stripping these in V2. These break
+// support for running in a SW and also expose
+// valuable info to data funcs that is being asked
+// for such as "is this a data request?".
+function stripIndexParam(request: Request) {
+  let url = new URL(request.url);
+  let indexValues = url.searchParams.getAll("index");
+  url.searchParams.delete("index");
+  let indexValuesToKeep = [];
+  for (let indexValue of indexValues) {
+    if (indexValue) {
+      indexValuesToKeep.push(indexValue);
+    }
+  }
+  for (let toKeep of indexValuesToKeep) {
+    url.searchParams.append("index", toKeep);
+  }
+
+  let init: RequestInit = {
+    method: request.method,
+    body: request.body,
+    headers: request.headers,
+    signal: request.signal,
+  };
+
+  if (init.body) {
+    (init as { duplex: "half" }).duplex = "half";
+  }
+
+  return new Request(url.href, init);
+}
+
+function stripDataParam(request: Request) {
+  let url = new URL(request.url);
+  url.searchParams.delete("_data");
+  let init: RequestInit = {
+    method: request.method,
+    body: request.body,
+    headers: request.headers,
+    signal: request.signal,
+  };
+
+  if (init.body) {
+    (init as { duplex: "half" }).duplex = "half";
+  }
+
+  return new Request(url.href, init);
+}
+
+function stripRoutesParam(request: Request) {
+  let url = new URL(request.url);
+  url.searchParams.delete("_routes");
+  let init: RequestInit = {
+    method: request.method,
+    body: request.body,
+    headers: request.headers,
+    signal: request.signal,
+  };
+
+  if (init.body) {
+    (init as { duplex: "half" }).duplex = "half";
+  }
+
+  return new Request(url.href, init);
 }

@@ -1,45 +1,60 @@
-import type {
-  InternalSignFunctionDoNotUseMe,
-  InternalUnsignFunctionDoNotUseMe
-} from "@remix-run/server-runtime/cookieSigning";
-
-import { atob, btoa } from "./base64";
-import { sign as remixSign, unsign as remixUnsign } from "./cookieSigning";
-import {
-  Headers as NodeHeaders,
-  Request as NodeRequest,
-  Response as NodeResponse,
-  fetch as nodeFetch
-} from "./fetch";
-
 declare global {
   namespace NodeJS {
+    interface ProcessEnv {
+      NODE_ENV: "development" | "production" | "test";
+    }
+
     interface Global {
-      atob: typeof atob;
-      btoa: typeof btoa;
+      File: typeof File;
 
       Headers: typeof Headers;
       Request: typeof Request;
       Response: typeof Response;
       fetch: typeof fetch;
+      FormData: typeof FormData;
 
-      // TODO: Once node v16 is available on AWS we should remove these globals
-      // and provide the webcrypto API instead.
-      sign: InternalSignFunctionDoNotUseMe;
-      unsign: InternalUnsignFunctionDoNotUseMe;
+      ReadableStream: typeof ReadableStream;
+      WritableStream: typeof WritableStream;
     }
+  }
+
+  interface RequestInit {
+    duplex?: "half";
   }
 }
 
-export function installGlobals() {
-  global.atob = atob;
-  global.btoa = btoa;
-
-  global.Headers = NodeHeaders as unknown as typeof Headers;
-  global.Request = NodeRequest as unknown as typeof Request;
-  global.Response = NodeResponse as unknown as typeof Response;
-  global.fetch = nodeFetch as unknown as typeof fetch;
-
-  global.sign = remixSign;
-  global.unsign = remixUnsign;
+export function installGlobals({
+  nativeFetch,
+}: { nativeFetch?: boolean } = {}) {
+  if (nativeFetch) {
+    let {
+      File: UndiciFile,
+      fetch: undiciFetch,
+      FormData: UndiciFormData,
+      Headers: UndiciHeaders,
+      Request: UndiciRequest,
+      Response: UndiciResponse,
+    } = require("undici");
+    global.File = UndiciFile as unknown as typeof File;
+    global.Headers = UndiciHeaders;
+    global.Request = UndiciRequest;
+    global.Response = UndiciResponse;
+    global.fetch = undiciFetch;
+    global.FormData = UndiciFormData;
+  } else {
+    let {
+      File: RemixFile,
+      fetch: RemixFetch,
+      FormData: RemixFormData,
+      Headers: RemixHeaders,
+      Request: RemixRequest,
+      Response: RemixResponse,
+    } = require("@remix-run/web-fetch");
+    global.File = RemixFile;
+    global.Headers = RemixHeaders;
+    global.Request = RemixRequest;
+    global.Response = RemixResponse;
+    global.fetch = RemixFetch;
+    global.FormData = RemixFormData;
+  }
 }

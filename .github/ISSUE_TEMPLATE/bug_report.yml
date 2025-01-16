@@ -1,54 +1,55 @@
 name: 🐛 Bug Report
 description: Something is wrong with Remix.
-title: "[Bug]: "
 labels:
-  - bug
+  - "bug:unverified"
 body:
   - type: markdown
     attributes:
       value: |
-        Thank you for contributing!
+        Thank you for helping to improve Remix!
 
-        Do you need some help?
-        ======================
-        The issue tracker is meant for feature requests and bug reports only. This isn't the best place for
-        support or usage questions. Questions here don't have as much visibility as they do elsewhere. Before
-        you ask a question, here are some resources to get help first:
+        ## Option 1: Submit a PR with a failing test
 
-        - Read the docs: https://remix.run/docs
-        - Explore examples: https://github.com/remix-run/remix/tree/dev/examples
-        - Look for/ask questions on Stack Overflow: https://stackoverflow.com/questions/ask?tags=remix
-        - Ask in GitHub Discussions: https://github.com/remix-run/remix/discussions
-        - Ask in chat: https://rmx.as/discord
+        🏆 The most helpful reproduction is to use our _bug report integration test_ template:
 
-        ### Test Case Starter:
-        https://stackblitz.com/github/remix-run/remix/tree/dev/examples/basic?file=app/root.tsx
-  - type: checkboxes
-    id: packages
+        1. [Fork `remix-run/remix`](https://github.com/remix-run/remix/fork)
+        2. Open [`integration/bug-report-test.ts`](https://github.com/remix-run/remix/blob/dev/integration/bug-report-test.ts) in your editor
+        3. Follow the instructions and submit a pull request with a failing bug report test!
+
+        ## Option 2: Continue filling out this form
+
+        If you'd rather open a GitHub issue, here are other ways to share a reproduction (ordered from most helpful to least):
+
+        - 🥇 Link to a [StackBlitz](https://remix.new) environment
+        - 🥈 Link to a GitHub repository
+        - 🥉 Description of project including template, `remix.config.js`, `package.json` scripts, etc.
+
+  - type: textarea
+    id: reproduction
     attributes:
-      label: Which Remix packages are impacted?
-      options:
-        - label: "`remix` (Remix core)"
-        - label: "`create-remix`"
-        - label: "`@remix-run/architect`"
-        - label: "`@remix-run/cloudflare-workers`"
-        - label: "`@remix-run/dev`"
-        - label: "`@remix-run/express`"
-        - label: "`@remix-run/netlify`"
-        - label: "`@remix-run/node`"
-        - label: "`@remix-run/react`"
-        - label: "`@remix-run/serve`"
-        - label: "`@remix-run/server-runtime`"
-        - label: "`@remix-run/vercel`"
-  - type: input
-    attributes:
-      label: What version of Remix are you using?
+      label: Reproduction
+      description: Link to reproduction and steps to reproduce the behavior
+      placeholder: Go to https://stackblitz.com/edit/... and click the "Submit" button
     validations:
       required: true
   - type: textarea
+    id: system-info
     attributes:
-      label: Steps to Reproduce
-      description: Steps to reproduce the behavior.
+      label: System Info
+      description: Output of `npx envinfo --system --npmPackages '{vite,@remix-run/*}' --binaries --browsers`
+      render: shell
+      placeholder: System, Binaries, Browsers
+    validations:
+      required: true
+  - type: dropdown
+    id: package-manager
+    attributes:
+      label: Used Package Manager
+      description: Select the used package manager
+      options:
+        - npm
+        - yarn
+        - pnpm
     validations:
       required: true
   - type: textarea
