@@ -1,15 +1,12 @@
-import type { Location } from "history";
-import React, { useContext } from "react";
+import * as React from "react";
+import type { Location } from "@remix-run/router";
+import { isRouteErrorResponse } from "react-router-dom";
 
-import type {
-  CatchBoundaryComponent,
-  ErrorBoundaryComponent
-} from "./routeModules";
-import type { ThrownResponse } from "./errors";
+import { Scripts, useRemixContext } from "./components";
 
 type RemixErrorBoundaryProps = React.PropsWithChildren<{
   location: Location;
-  component: ErrorBoundaryComponent;
+  isOutsideRemixApp?: boolean;
   error?: Error;
 }>;
 
@@ -24,7 +21,6 @@ export class RemixErrorBoundary extends React.Component<
 > {
   constructor(props: RemixErrorBoundaryProps) {
     super(props);
-
     this.state = { error: props.error || null, location: props.location };
   }
 
@@ -48,12 +44,22 @@ export class RemixErrorBoundary extends React.Component<
     if (state.location !== props.location) {
       return { error: props.error || null, location: props.location };
     }
-    return state;
+
+    // If we're not changing locations, preserve the location but still surface
+    // any new errors that may come through. We retain the existing error, we do
+    // this because the error provided from the app state may be cleared without
+    // the location changing.
+    return { error: props.error || state.error, location: state.location };
   }
 
   render() {
     if (this.state.error) {
-      return <this.props.component error={this.state.error} />;
+      return (
+        <RemixRootDefaultErrorBoundary
+          error={this.state.error}
+          isOutsideRemixApp={true}
+        />
+      );
     } else {
       return this.props.children;
     }
@@ -63,137 +69,119 @@ export class RemixErrorBoundary extends React.Component<
 /**
  * When app's don't provide a root level ErrorBoundary, we default to this.
  */
-export function RemixRootDefaultErrorBoundary({ error }: { error: Error }) {
+export function RemixRootDefaultErrorBoundary({
+  error,
+  isOutsideRemixApp,
+}: {
+  error: unknown;
+  isOutsideRemixApp?: boolean;
+}) {
   console.error(error);
-  return (
-    <html lang="en">
-      <head>
-        <meta charSet="utf-8" />
-        <title>Uncaught Exception!</title>
-      </head>
-      <body>
-        <main
-          style={{
-            border: "solid 2px hsl(10, 50%, 50%)",
-            padding: "2rem"
-          }}
-        >
-          <div>
-            <h1>Uncaught Exception!</h1>
-            <p>
-              If you are not the developer, please click back in your browser
-              and try again.
-            </p>
-            <div
-              style={{
-                fontFamily: `"SFMono-Regular",Consolas,"Liberation Mono",Menlo,Courier,monospace`,
-                padding: "1rem",
-                margin: "1rem 0",
-                border: "solid 4px"
-              }}
-            >
-              {error.message}
-            </div>
-            <p>
-              There was an uncaught exception in your application. Check the
-              browser console and/or server console to inspect the error.
-            </p>
-            <p>
-              If you are the developer, consider adding your own error boundary
-              so users don't see this page when unexpected errors happen in
-              production!
-            </p>
-            <p>
-              Read more about{" "}
-              <a
-                target="_blank"
-                rel="noreferrer"
-                href="https://remix.run/guides/errors"
-              >
-                Error Handling in Remix
-              </a>
-              .
-            </p>
-          </div>
-        </main>
-      </body>
-    </html>
+
+  let heyDeveloper = (
+    <script
+      dangerouslySetInnerHTML={{
+        __html: `
+        console.log(
+          "💿 Hey developer 👋. You can provide a way better UX than this when your app throws errors. Check out https://remix.run/guides/errors for more information."
+        );
+      `,
+      }}
+    />
   );
-}
 
-let RemixCatchContext = React.createContext<ThrownResponse | undefined>(
-  undefined
-);
-
-export function useCatch<
-  Result extends ThrownResponse = ThrownResponse
->(): Result {
-  return useContext(RemixCatchContext) as Result;
-}
-
-type RemixCatchBoundaryProps = React.PropsWithChildren<{
-  location: Location;
-  component: CatchBoundaryComponent;
-  catch?: ThrownResponse;
-}>;
-
-export function RemixCatchBoundary({
-  catch: catchVal,
-  component: Component,
-  children
-}: RemixCatchBoundaryProps) {
-  if (catchVal) {
+  if (isRouteErrorResponse(error)) {
     return (
-      <RemixCatchContext.Provider value={catchVal}>
-        <Component />
-      </RemixCatchContext.Provider>
+      <BoundaryShell title="Unhandled Thrown Response!">
+        <h1 style={{ fontSize: "24px" }}>
+          {error.status} {error.statusText}
+        </h1>
+        {heyDeveloper}
+      </BoundaryShell>
     );
   }
 
-  return <>{children}</>;
+  let errorInstance: Error;
+  if (error instanceof Error) {
+    errorInstance = error;
+  } else {
+    let errorString =
+      error == null
+        ? "Unknown Error"
+        : typeof error === "object" && "toString" in error
+        ? error.toString()
+        : JSON.stringify(error);
+    errorInstance = new Error(errorString);
+  }
+
+  return (
+    <BoundaryShell
+      title="Application Error!"
+      isOutsideRemixApp={isOutsideRemixApp}
+    >
+      <h1 style={{ fontSize: "24px" }}>Application Error</h1>
+      <pre
+        style={{
+          padding: "2rem",
+          background: "hsla(10, 50%, 50%, 0.1)",
+          color: "red",
+          overflow: "auto",
+        }}
+      >
+        {errorInstance.stack}
+      </pre>
+      {heyDeveloper}
+    </BoundaryShell>
+  );
 }
 
-/**
- * When app's don't provide a root level ErrorBoundary, we default to this.
- */
-export function RemixRootDefaultCatchBoundary() {
+export function BoundaryShell({
+  title,
+  renderScripts,
+  isOutsideRemixApp,
+  children,
+}: {
+  title: string;
+  renderScripts?: boolean;
+  isOutsideRemixApp?: boolean;
+  children: React.ReactNode | React.ReactNode[];
+}) {
+  let { routeModules } = useRemixContext();
+
+  // Generally speaking, when the root route has a Layout we want to use that
+  // as the app shell instead of the default `BoundaryShell` wrapper markup below.
+  // This is true for `loader`/`action` errors, most render errors, and
+  // `HydrateFallback` scenarios.
+
+  // However, render errors thrown from the `Layout` present a bit of an issue
+  // because if the `Layout` itself throws during the `ErrorBoundary` pass and
+  // we bubble outside the `RouterProvider` to the wrapping `RemixErrorBoundary`,
+  // by returning only `children` here we'll be trying to append a `<div>` to
+  // the `document` and the DOM will throw, putting React into an error/hydration
+  // loop.
+
+  // Instead, if we're ever rendering from the outermost `RemixErrorBoundary`
+  // during hydration that wraps `RouterProvider`, then we can't trust the
+  // `Layout` and should fallback to the default app shell so we're always
+  // returning an `<html>` document.
+  if (routeModules.root?.Layout && !isOutsideRemixApp) {
+    return children;
+  }
+
   return (
     <html lang="en">
       <head>
         <meta charSet="utf-8" />
-        <title>Unhandled Thrown Response!</title>
+        <meta
+          name="viewport"
+          content="width=device-width,initial-scale=1,viewport-fit=cover"
+        />
+        <title>{title}</title>
       </head>
       <body>
-        <main
-          style={{
-            border: "solid 2px hsl(10, 50%, 50%)",
-            padding: "2rem"
-          }}
-        >
-          <div>
-            <h1>Unhandled Thrown Response!</h1>
-            <p>
-              If you are not the developer, please click back in your browser
-              and try again.
-            </p>
-            <p>There was an unhandled thrown response in your application.</p>
-            <p>
-              If you are the developer, consider adding your own catch boundary
-              so users don't see this page when unhandled thrown response happen
-              in production!
-            </p>
-            <p>
-              Read more about{" "}
-              <a
-                target="_blank"
-                rel="noreferrer"
-                href="https://remix.run/guides/errors"
-              >
-                Throwing Responses in Remix
-              </a>
-              .
-            </p>
-          </div>
+        <main style={{ fontFamily: "system-ui, sans-serif", padding: "2rem" }}>
+          {children}
+          {renderScripts ? <Scripts /> : null}
         </main>
       </body>
     </html>

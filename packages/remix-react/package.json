@@ -1,26 +1,59 @@
 {
   "name": "@remix-run/react",
+  "version": "2.15.3",
   "description": "React DOM bindings for Remix",
-  "version": "1.0.6",
+  "bugs": {
+    "url": "https://github.com/remix-run/remix/issues"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/remix-run/remix",
     "directory": "packages/remix-react"
   },
-  "bugs": {
-    "url": "https://github.com/remix-run/remix/issues"
+  "license": "MIT",
+  "sideEffects": false,
+  "main": "dist/index.js",
+  "typings": "dist/index.d.ts",
+  "module": "dist/esm/index.js",
+  "scripts": {
+    "tsc": "tsc"
   },
-  "main": "index.js",
-  "browser": "browser/index.js",
   "dependencies": {
-    "react-router-dom": "^6.0.2"
-  },
-  "peerDependencies": {
-    "react": ">=16.8",
-    "react-dom": ">=16.8"
+    "@remix-run/router": "1.22.0",
+    "@remix-run/server-runtime": "workspace:*",
+    "react-router": "6.29.0",
+    "react-router-dom": "6.29.0",
+    "turbo-stream": "2.4.0"
   },
   "devDependencies": {
-    "abort-controller": "^3.0.0"
+    "@remix-run/node": "workspace:*",
+    "@remix-run/react": "workspace:*",
+    "@testing-library/jest-dom": "^5.17.0",
+    "@testing-library/react": "^13.3.0",
+    "@types/react": "^18.2.20",
+    "jest-environment-jsdom": "^29.6.4",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "typescript": "^5.1.6"
   },
-  "sideEffects": false
+  "peerDependencies": {
+    "react": "^18.0.0",
+    "react-dom": "^18.0.0",
+    "typescript": "^5.1.0"
+  },
+  "peerDependenciesMeta": {
+    "typescript": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "dist/",
+    "future/",
+    "CHANGELOG.md",
+    "LICENSE.md",
+    "README.md"
+  ]
 }

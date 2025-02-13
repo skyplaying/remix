@@ -1,687 +1,768 @@
+import type {
+  UNSAFE_DeferredData as DeferredData,
+  ErrorResponse,
+  StaticHandler,
+} from "@remix-run/router";
+import {
+  UNSAFE_DEFERRED_SYMBOL as DEFERRED_SYMBOL,
+  getStaticContextFromError,
+  isRouteErrorResponse,
+  createStaticHandler,
+  json as routerJson,
+  stripBasename,
+  UNSAFE_ErrorResponseImpl as ErrorResponseImpl,
+} from "@remix-run/router";
+
 import type { AppLoadContext } from "./data";
-import { extractData, isCatchResponse } from "./data";
-import { loadRouteData, callRouteAction, isRedirectResponse } from "./data";
-import type { ComponentDidCatchEmulator } from "./errors";
-import type { ServerBuild } from "./build";
+import type { HandleErrorFunction, ServerBuild } from "./build";
 import type { EntryContext } from "./entry";
-import { createEntryMatches, createEntryRouteModules } from "./entry";
-import { serializeError } from "./errors";
+import { createEntryRouteModules } from "./entry";
+import { sanitizeErrors, serializeError, serializeErrors } from "./errors";
 import { getDocumentHeaders } from "./headers";
-import type { ServerPlatform } from "./platform";
+import invariant from "./invariant";
+import { ServerMode, isServerMode } from "./mode";
 import type { RouteMatch } from "./routeMatching";
 import { matchServerRoutes } from "./routeMatching";
-import { ServerMode, isServerMode } from "./mode";
-import type { ServerRoute } from "./routes";
-import { createRoutes } from "./routes";
-import { createActionData, createRouteData } from "./routeData";
-import { json } from "./responses";
+import type { EntryRoute, ServerRoute } from "./routes";
+import { createStaticHandlerDataRoutes, createRoutes } from "./routes";
+import {
+  createDeferredReadableStream,
+  isRedirectResponse,
+  isResponse,
+  json,
+} from "./responses";
 import { createServerHandoffString } from "./serverHandoff";
+import { getDevServerHooks } from "./dev";
+import type { SingleFetchResult, SingleFetchResults } from "./single-fetch";
+import {
+  encodeViaTurboStream,
+  getSingleFetchRedirect,
+  singleFetchAction,
+  singleFetchLoaders,
+  SingleFetchRedirectSymbol,
+  SINGLE_FETCH_REDIRECT_STATUS,
+} from "./single-fetch";
+import { resourceRouteJsonWarning } from "./deprecations";
 
-/**
- * The main request handler for a Remix server. This handler runs in the context
- * of a cloud provider's server (e.g. Express on Firebase) or locally via their
- * dev tools.
- */
-export interface RequestHandler {
-  (request: Request, loadContext?: AppLoadContext): Promise<Response>;
-}
-
-type RequestType = "data" | "document" | "resource";
-
-function getRequestType(
+export type RequestHandler = (
   request: Request,
-  matches: RouteMatch<ServerRoute>[] | null
-): RequestType {
-  if (isDataRequest(request)) {
-    return "data";
-  }
+  loadContext?: AppLoadContext
+) => Promise<Response>;
 
-  if (!matches) {
-    return "document";
-  }
+export type CreateRequestHandlerFunction = (
+  build: ServerBuild | (() => ServerBuild | Promise<ServerBuild>),
+  mode?: string
+) => RequestHandler;
 
-  let match = matches.slice(-1)[0];
-  if (!match.route.module.default) {
-    return "resource";
-  }
+// Do not include a response body if the status code is one of these,
+// otherwise `undici` will throw an error when constructing the Response:
+//   https://github.com/nodejs/undici/blob/bd98a6303e45d5e0d44192a93731b1defdb415f3/lib/web/fetch/response.js#L522-L528
+//
+// Specs:
+//   https://datatracker.ietf.org/doc/html/rfc9110#name-informational-1xx
+//   https://datatracker.ietf.org/doc/html/rfc9110#name-204-no-content
+//   https://datatracker.ietf.org/doc/html/rfc9110#name-205-reset-content
+//   https://datatracker.ietf.org/doc/html/rfc9110#name-304-not-modified
+const NO_BODY_STATUS_CODES = new Set([100, 101, 204, 205, 304]);
 
-  return "document";
+function derive(build: ServerBuild, mode?: string) {
+  let routes = createRoutes(build.routes);
+  let dataRoutes = createStaticHandlerDataRoutes(build.routes, build.future);
+  let serverMode = isServerMode(mode) ? mode : ServerMode.Production;
+  let staticHandler = createStaticHandler(dataRoutes, {
+    basename: build.basename,
+    future: {
+      v7_relativeSplatPath: build.future?.v3_relativeSplatPath === true,
+      v7_throwAbortReason: build.future?.v3_throwAbortReason === true,
+    },
+  });
+
+  let errorHandler =
+    build.entry.module.handleError ||
+    ((error, { request }) => {
+      if (serverMode !== ServerMode.Test && !request.signal.aborted) {
+        console.error(
+          // @ts-expect-error This is "private" from users but intended for internal use
+          isRouteErrorResponse(error) && error.error ? error.error : error
+        );
+      }
+    });
+  return {
+    routes,
+    dataRoutes,
+    serverMode,
+    staticHandler,
+    errorHandler,
+  };
 }
 
-/**
- * Creates a function that serves HTTP requests.
- */
-export function createRequestHandler(
-  build: ServerBuild,
-  platform: ServerPlatform,
-  mode?: string
-): RequestHandler {
-  let routes = createRoutes(build.routes);
-  let serverMode = isServerMode(mode) ? mode : ServerMode.Production;
+export const createRequestHandler: CreateRequestHandlerFunction = (
+  build,
+  mode
+) => {
+  let _build: ServerBuild;
+  let routes: ServerRoute[];
+  let serverMode: ServerMode;
+  let staticHandler: StaticHandler;
+  let errorHandler: HandleErrorFunction;
 
-  return async (request, loadContext = {}) => {
-    let url = new URL(request.url);
-    let matches = matchServerRoutes(routes, url.pathname);
-
-    let requestType = getRequestType(request, matches);
-
-    let response: Response;
-
-    switch (requestType) {
-      // has _data
-      case "data":
-        response = await handleDataRequest(
-          request,
-          loadContext,
-          build,
-          platform,
-          matches
-        );
-        break;
-      // no _data & default export
-      case "document":
-        response = await handleDocumentRequest(
-          request,
-          loadContext,
-          build,
-          platform,
-          routes,
-          serverMode
-        );
-        break;
-      // no _data  or default export
-      case "resource":
-        response = await handleResourceRequest(
-          request,
-          loadContext,
-          build,
-          platform,
-          matches
-        );
-        break;
+  return async function requestHandler(request, loadContext = {}) {
+    _build = typeof build === "function" ? await build() : build;
+    mode ??= _build.mode;
+    if (typeof build === "function") {
+      let derived = derive(_build, mode);
+      routes = derived.routes;
+      serverMode = derived.serverMode;
+      staticHandler = derived.staticHandler;
+      errorHandler = derived.errorHandler;
+    } else if (!routes || !serverMode || !staticHandler || !errorHandler) {
+      let derived = derive(_build, mode);
+      routes = derived.routes;
+      serverMode = derived.serverMode;
+      staticHandler = derived.staticHandler;
+      errorHandler = derived.errorHandler;
     }
 
-    if (isHeadRequest(request)) {
+    let url = new URL(request.url);
+    let params: RouteMatch<ServerRoute>["params"] = {};
+    let handleError = (error: unknown) => {
+      if (mode === ServerMode.Development) {
+        getDevServerHooks()?.processRequestError?.(error);
+      }
+
+      errorHandler(error, {
+        context: loadContext,
+        params,
+        request,
+      });
+    };
+
+    // Manifest request for fog of war
+
+    let manifestUrl = `${_build.basename ?? "/"}/__manifest`.replace(
+      /\/+/g,
+      "/"
+    );
+    if (url.pathname === manifestUrl) {
+      try {
+        let res = await handleManifestRequest(_build, routes, url);
+        return res;
+      } catch (e) {
+        handleError(e);
+        return new Response("Unknown Server Error", { status: 500 });
+      }
+    }
+
+    let matches = matchServerRoutes(routes, url.pathname, _build.basename);
+    if (matches && matches.length > 0) {
+      Object.assign(params, matches[0].params);
+    }
+
+    let response: Response;
+    if (url.searchParams.has("_data")) {
+      if (_build.future.v3_singleFetch) {
+        handleError(
+          new Error(
+            "Warning: Single fetch-enabled apps should not be making ?_data requests, " +
+              "this is likely to break in the future"
+          )
+        );
+      }
+      let routeId = url.searchParams.get("_data")!;
+
+      response = await handleDataRequest(
+        serverMode,
+        _build,
+        staticHandler,
+        routeId,
+        request,
+        loadContext,
+        handleError
+      );
+
+      if (_build.entry.module.handleDataRequest) {
+        response = await _build.entry.module.handleDataRequest(response, {
+          context: loadContext,
+          params,
+          request,
+        });
+
+        if (isRedirectResponse(response)) {
+          response = createRemixRedirectResponse(response, _build.basename);
+        }
+      }
+    } else if (_build.future.v3_singleFetch && url.pathname.endsWith(".data")) {
+      let handlerUrl = new URL(request.url);
+      handlerUrl.pathname = handlerUrl.pathname
+        .replace(/\.data$/, "")
+        .replace(/^\/_root$/, "/");
+
+      let singleFetchMatches = matchServerRoutes(
+        routes,
+        handlerUrl.pathname,
+        _build.basename
+      );
+
+      response = await handleSingleFetchRequest(
+        serverMode,
+        _build,
+        staticHandler,
+        request,
+        handlerUrl,
+        loadContext,
+        handleError
+      );
+
+      if (_build.entry.module.handleDataRequest) {
+        response = await _build.entry.module.handleDataRequest(response, {
+          context: loadContext,
+          params: singleFetchMatches ? singleFetchMatches[0].params : {},
+          request,
+        });
+
+        if (isRedirectResponse(response)) {
+          let result: SingleFetchResult | SingleFetchResults =
+            getSingleFetchRedirect(
+              response.status,
+              response.headers,
+              _build.basename
+            );
+
+          if (request.method === "GET") {
+            result = {
+              [SingleFetchRedirectSymbol]: result,
+            };
+          }
+          let headers = new Headers(response.headers);
+          headers.set("Content-Type", "text/x-script");
+
+          return new Response(
+            encodeViaTurboStream(
+              result,
+              request.signal,
+              _build.entry.module.streamTimeout,
+              serverMode
+            ),
+            {
+              status: SINGLE_FETCH_REDIRECT_STATUS,
+              headers,
+            }
+          );
+        }
+      }
+    } else if (
+      matches &&
+      matches[matches.length - 1].route.module.default == null &&
+      matches[matches.length - 1].route.module.ErrorBoundary == null
+    ) {
+      response = await handleResourceRequest(
+        serverMode,
+        _build,
+        staticHandler,
+        matches.slice(-1)[0].route.id,
+        request,
+        loadContext,
+        handleError
+      );
+    } else {
+      let criticalCss =
+        mode === ServerMode.Development
+          ? await getDevServerHooks()?.getCriticalCss?.(_build, url.pathname)
+          : undefined;
+
+      response = await handleDocumentRequest(
+        serverMode,
+        _build,
+        staticHandler,
+        request,
+        loadContext,
+        handleError,
+        criticalCss
+      );
+    }
+
+    if (request.method === "HEAD") {
       return new Response(null, {
         headers: response.headers,
         status: response.status,
-        statusText: response.statusText
+        statusText: response.statusText,
       });
     }
 
     return response;
   };
-}
+};
 
-async function handleResourceRequest(
-  request: Request,
-  loadContext: AppLoadContext,
+async function handleManifestRequest(
   build: ServerBuild,
-  platform: ServerPlatform,
-  matches: RouteMatch<ServerRoute>[] | null
-): Promise<Response> {
-  let url = new URL(request.url);
+  routes: ServerRoute[],
+  url: URL
+) {
+  let patches: Record<string, EntryRoute> = {};
 
-  if (!matches) {
-    return jsonError(`No route matches URL "${url.pathname}"`, 404);
+  if (url.searchParams.has("p")) {
+    for (let path of url.searchParams.getAll("p")) {
+      let matches = matchServerRoutes(routes, path, build.basename);
+      if (matches) {
+        for (let match of matches) {
+          let routeId = match.route.id;
+          patches[routeId] = build.assets.routes[routeId];
+        }
+      }
+    }
+
+    return json(patches, {
+      headers: {
+        "Cache-Control": "public, max-age=31536000, immutable",
+      },
+    }) as Response; // Override the TypedResponse stuff from json()
   }
 
-  let routeMatch: RouteMatch<ServerRoute> = matches.slice(-1)[0];
-  try {
-    return isActionRequest(request)
-      ? await callRouteAction(
-          build,
-          routeMatch.route.id,
-          request,
-          loadContext,
-          routeMatch.params
-        )
-      : await loadRouteData(
-          build,
-          routeMatch.route.id,
-          request,
-          loadContext,
-          routeMatch.params
-        );
-  } catch (error: any) {
-    let formattedError = (await platform.formatServerError?.(error)) || error;
-    throw formattedError;
-  }
+  return new Response("Invalid Request", { status: 400 });
 }
 
 async function handleDataRequest(
+  serverMode: ServerMode,
+  build: ServerBuild,
+  staticHandler: StaticHandler,
+  routeId: string,
   request: Request,
   loadContext: AppLoadContext,
-  build: ServerBuild,
-  platform: ServerPlatform,
-  matches: RouteMatch<ServerRoute>[] | null
-): Promise<Response> {
-  if (!isValidRequestMethod(request)) {
-    return jsonError(`Invalid request method "${request.method}"`, 405);
-  }
-
-  let url = new URL(request.url);
-
-  if (!matches) {
-    return jsonError(`No route matches URL "${url.pathname}"`, 404);
-  }
-
-  let routeMatch: RouteMatch<ServerRoute>;
-  if (isActionRequest(request)) {
-    routeMatch = matches[matches.length - 1];
-
-    if (
-      !isIndexRequestUrl(url) &&
-      matches[matches.length - 1].route.id.endsWith("/index")
-    ) {
-      routeMatch = matches[matches.length - 2];
-    }
-  } else {
-    let routeId = url.searchParams.get("_data");
-    if (!routeId) {
-      return jsonError(`Missing route id in ?_data`, 403);
-    }
-
-    let match = matches.find(match => match.route.id === routeId);
-    if (!match) {
-      return jsonError(
-        `Route "${routeId}" does not match URL "${url.pathname}"`,
-        403
-      );
-    }
-
-    routeMatch = match;
-  }
-
-  let clonedRequest = stripIndexParam(stripDataParam(request));
-
-  let response: Response;
+  handleError: (err: unknown) => void
+) {
   try {
-    response = isActionRequest(request)
-      ? await callRouteAction(
-          build,
-          routeMatch.route.id,
-          clonedRequest,
-          loadContext,
-          routeMatch.params
-        )
-      : await loadRouteData(
-          build,
-          routeMatch.route.id,
-          clonedRequest,
-          loadContext,
-          routeMatch.params
-        );
-  } catch (error: any) {
-    let formattedError = (await platform.formatServerError?.(error)) || error;
-    response = json(await serializeError(formattedError), {
+    let response = await staticHandler.queryRoute(request, {
+      routeId,
+      requestContext: loadContext,
+    });
+
+    if (isRedirectResponse(response)) {
+      return createRemixRedirectResponse(response, build.basename);
+    }
+
+    if (DEFERRED_SYMBOL in response) {
+      let deferredData = response[DEFERRED_SYMBOL] as DeferredData;
+      let body = createDeferredReadableStream(
+        deferredData,
+        request.signal,
+        serverMode
+      );
+      let init = deferredData.init || {};
+      let headers = new Headers(init.headers);
+      headers.set("Content-Type", "text/remix-deferred");
+      // Mark successful responses with a header so we can identify in-flight
+      // network errors that are missing this header
+      headers.set("X-Remix-Response", "yes");
+      init.headers = headers;
+      return new Response(body, init);
+    }
+
+    // Mark all successful responses with a header so we can identify in-flight
+    // network errors that are missing this header
+    response = safelySetHeader(response, "X-Remix-Response", "yes");
+    return response;
+  } catch (error: unknown) {
+    if (isResponse(error)) {
+      let response = safelySetHeader(error, "X-Remix-Catch", "yes");
+      return response;
+    }
+
+    if (isRouteErrorResponse(error)) {
+      handleError(error);
+      return errorResponseToJson(error, serverMode);
+    }
+
+    let errorInstance =
+      error instanceof Error || error instanceof DOMException
+        ? error
+        : new Error("Unexpected Server Error");
+    handleError(errorInstance);
+    return routerJson(serializeError(errorInstance, serverMode), {
       status: 500,
       headers: {
-        "X-Remix-Error": "unfortunately, yes"
-      }
+        "X-Remix-Error": "yes",
+      },
     });
   }
+}
 
-  if (isRedirectResponse(response)) {
-    // We don't have any way to prevent a fetch request from following
-    // redirects. So we use the `X-Remix-Redirect` header to indicate the
-    // next URL, and then "follow" the redirect manually on the client.
-    let headers = new Headers(response.headers);
-    headers.set("X-Remix-Redirect", headers.get("Location")!);
-    headers.delete("Location");
+async function handleSingleFetchRequest(
+  serverMode: ServerMode,
+  build: ServerBuild,
+  staticHandler: StaticHandler,
+  request: Request,
+  handlerUrl: URL,
+  loadContext: AppLoadContext,
+  handleError: (err: unknown) => void
+): Promise<Response> {
+  let { result, headers, status } =
+    request.method !== "GET"
+      ? await singleFetchAction(
+          build,
+          serverMode,
+          staticHandler,
+          request,
+          handlerUrl,
+          loadContext,
+          handleError
+        )
+      : await singleFetchLoaders(
+          build,
+          serverMode,
+          staticHandler,
+          request,
+          handlerUrl,
+          loadContext,
+          handleError
+        );
 
-    return new Response("", {
-      status: 204,
-      headers
-    });
+  // Mark all successful responses with a header so we can identify in-flight
+  // network errors that are missing this header
+  let resultHeaders = new Headers(headers);
+  resultHeaders.set("X-Remix-Response", "yes");
+
+  // Skip response body for unsupported status codes
+  if (NO_BODY_STATUS_CODES.has(status)) {
+    return new Response(null, { status, headers: resultHeaders });
   }
 
-  if (build.entry.module.handleDataRequest) {
-    clonedRequest = stripIndexParam(stripDataParam(request));
-    return build.entry.module.handleDataRequest(response, {
-      request: clonedRequest,
-      context: loadContext,
-      params: routeMatch.params
-    });
-  }
+  // We use a less-descriptive `text/x-script` here instead of something like
+  // `text/x-turbo` to enable compression when deployed via Cloudflare.  See:
+  //  - https://github.com/remix-run/remix/issues/9884
+  //  - https://developers.cloudflare.com/speed/optimization/content/brotli/content-compression/
+  resultHeaders.set("Content-Type", "text/x-script");
 
-  return response;
+  // Note: Deferred data is already just Promises, so we don't have to mess
+  // `activeDeferreds` or anything :)
+  return new Response(
+    encodeViaTurboStream(
+      result,
+      request.signal,
+      build.entry.module.streamTimeout,
+      serverMode
+    ),
+    {
+      status: status || 200,
+      headers: resultHeaders,
+    }
+  );
 }
 
 async function handleDocumentRequest(
+  serverMode: ServerMode,
+  build: ServerBuild,
+  staticHandler: StaticHandler,
   request: Request,
   loadContext: AppLoadContext,
-  build: ServerBuild,
-  platform: ServerPlatform,
-  routes: ServerRoute[],
-  serverMode: ServerMode
-): Promise<Response> {
-  let url = new URL(request.url);
+  handleError: (err: unknown) => void,
+  criticalCss?: string
+) {
+  let context;
+  try {
+    context = await staticHandler.query(request, {
+      requestContext: loadContext,
+    });
+  } catch (error: unknown) {
+    handleError(error);
+    return new Response(null, { status: 500 });
+  }
 
-  let requestState: "ok" | "no-match" | "invalid-request" =
-    isValidRequestMethod(request) ? "ok" : "invalid-request";
-  let matches =
-    requestState === "ok" ? matchServerRoutes(routes, url.pathname) : null;
+  if (isResponse(context)) {
+    return context;
+  }
 
-  if (!matches) {
-    // If we do not match a user-provided-route, fall back to the root
-    // to allow the CatchBoundary to take over while maintining invalid
-    // request state if already set
-    if (requestState === "ok") {
-      requestState = "no-match";
-    }
+  let headers = getDocumentHeaders(build, context);
 
-    matches = [
-      {
-        params: {},
-        pathname: "",
-        route: routes[0]
+  // Skip response body for unsupported status codes
+  if (NO_BODY_STATUS_CODES.has(context.statusCode)) {
+    return new Response(null, { status: context.statusCode, headers });
+  }
+
+  // Sanitize errors outside of development environments
+  if (context.errors) {
+    Object.values(context.errors).forEach((err) => {
+      // @ts-expect-error `err.error` is "private" from users but intended for internal use
+      if (!isRouteErrorResponse(err) || err.error) {
+        handleError(err);
       }
-    ];
+    });
+    context.errors = sanitizeErrors(context.errors, serverMode);
   }
 
-  let componentDidCatchEmulator: ComponentDidCatchEmulator = {
-    trackBoundaries: true,
-    trackCatchBoundaries: true,
-    catchBoundaryRouteId: null,
-    renderBoundaryRouteId: null,
-    loaderBoundaryRouteId: null,
-    error: undefined,
-    catch: undefined
-  };
-
-  let responseState: "ok" | "caught" | "error" = "ok";
-  let actionResponse: Response | undefined;
-  let actionRouteId: string | undefined;
-
-  if (requestState !== "ok") {
-    responseState = "caught";
-    componentDidCatchEmulator.trackCatchBoundaries = false;
-    let withBoundaries = getMatchesUpToDeepestBoundary(
-      matches,
-      "CatchBoundary"
-    );
-    componentDidCatchEmulator.catchBoundaryRouteId =
-      withBoundaries.length > 0
-        ? withBoundaries[withBoundaries.length - 1].route.id
-        : null;
-    componentDidCatchEmulator.catch = {
-      status: requestState === "no-match" ? 404 : 405,
-      statusText:
-        requestState === "no-match" ? "Not Found" : "Method Not Allowed",
-      data: null
-    };
-  } else if (isActionRequest(request)) {
-    let actionMatch = matches[matches.length - 1];
-    if (!isIndexRequestUrl(url) && actionMatch.route.id.endsWith("/index")) {
-      actionMatch = matches[matches.length - 2];
-    }
-    actionRouteId = actionMatch.route.id;
-
-    try {
-      let clonedRequest = stripIndexParam(stripDataParam(request));
-
-      actionResponse = await callRouteAction(
-        build,
-        actionMatch.route.id,
-        clonedRequest,
-        loadContext,
-        actionMatch.params
-      );
-      if (isRedirectResponse(actionResponse)) {
-        return actionResponse;
-      }
-    } catch (error: any) {
-      let formattedError = (await platform.formatServerError?.(error)) || error;
-      responseState = "error";
-      let withBoundaries = getMatchesUpToDeepestBoundary(
-        matches,
-        "ErrorBoundary"
-      );
-      componentDidCatchEmulator.loaderBoundaryRouteId =
-        withBoundaries[withBoundaries.length - 1].route.id;
-      componentDidCatchEmulator.error = await serializeError(formattedError);
-    }
-  }
-
-  if (actionResponse && isCatchResponse(actionResponse)) {
-    responseState = "caught";
-    let withBoundaries = getMatchesUpToDeepestBoundary(
-      matches,
-      "CatchBoundary"
-    );
-    componentDidCatchEmulator.trackCatchBoundaries = false;
-    componentDidCatchEmulator.catchBoundaryRouteId =
-      withBoundaries[withBoundaries.length - 1].route.id;
-    componentDidCatchEmulator.catch = {
-      status: actionResponse.status,
-      statusText: actionResponse.statusText,
-      data: await extractData(actionResponse.clone())
-    };
-  }
-
-  // If we did not match a route, there is no need to call any loaders
-  let matchesToLoad = requestState !== "ok" ? [] : matches;
-  switch (responseState) {
-    case "caught":
-      matchesToLoad = getMatchesUpToDeepestBoundary(
-        // get rid of the action, we don't want to call it's loader either
-        // because we'll be rendering the catch boundary, if you can get access
-        // to the loader data in the catch boundary then how the heck is it
-        // supposed to deal with thrown responses?
-        matches.slice(0, -1),
-        "CatchBoundary"
-      );
-      break;
-    case "error":
-      matchesToLoad = getMatchesUpToDeepestBoundary(
-        // get rid of the action, we don't want to call it's loader either
-        // because we'll be rendering the error boundary, if you can get access
-        // to the loader data in the error boundary then how the heck is it
-        // supposed to deal with errors in the loader, too?
-        matches.slice(0, -1),
-        "ErrorBoundary"
-      );
-      break;
-  }
-
-  // Run all data loaders in parallel. Await them in series below.  Note: This
-  // code is a little weird due to the way unhandled promise rejections are
-  // handled in node. We use a .catch() handler on each promise to avoid the
-  // warning, then handle errors manually afterwards.
-  let routeLoaderPromises: Promise<Response | Error>[] = matchesToLoad.map(
-    match =>
-      loadRouteData(
-        build,
-        match.route.id,
-        stripIndexParam(stripDataParam(request.clone())),
-        loadContext,
-        match.params
-      ).catch(error => error)
-  );
-
-  let routeLoaderResults = await Promise.all(routeLoaderPromises);
-  for (let [index, response] of routeLoaderResults.entries()) {
-    let route = matches[index].route;
-    let routeModule = build.routes[route.id].module;
-
-    // Rare case where an action throws an error, and then when we try to render
-    // the action's page to tell the user about the the error, a loader above
-    // the action route *also* threw an error or tried to redirect!
-    //
-    // Instead of rendering the loader error or redirecting like usual, we
-    // ignore the loader error or redirect because the action error was first
-    // and is higher priority to surface.  Perhaps the action error is the
-    // reason the loader blows up now! It happened first and is more important
-    // to address.
-    //
-    // We just give up and move on with rendering the error as deeply as we can,
-    // which is the previous iteration of this loop
-    if (
-      (responseState === "error" &&
-        (response instanceof Error || isRedirectResponse(response))) ||
-      (responseState === "caught" && isCatchResponse(response))
-    ) {
-      break;
-    }
-
-    if (componentDidCatchEmulator.catch || componentDidCatchEmulator.error) {
-      continue;
-    }
-
-    if (routeModule.CatchBoundary) {
-      componentDidCatchEmulator.catchBoundaryRouteId = route.id;
-    }
-
-    if (routeModule.ErrorBoundary) {
-      componentDidCatchEmulator.loaderBoundaryRouteId = route.id;
-    }
-
-    if (response instanceof Error) {
-      if (serverMode !== ServerMode.Test) {
-        console.error(
-          `There was an error running the data loader for route ${route.id}`
-        );
-      }
-
-      let formattedError =
-        (await platform.formatServerError?.(response)) || response;
-
-      componentDidCatchEmulator.error = await serializeError(formattedError);
-      routeLoaderResults[index] = json(null, { status: 500 });
-    } else if (isRedirectResponse(response)) {
-      return response;
-    } else if (isCatchResponse(response)) {
-      componentDidCatchEmulator.trackCatchBoundaries = false;
-      componentDidCatchEmulator.catch = {
-        status: response.status,
-        statusText: response.statusText,
-        data: await extractData(response.clone())
-      };
-      routeLoaderResults[index] = json(null, { status: response.status });
-    }
-  }
-
-  // We already filtered out all Errors, so these are all Responses.
-  let routeLoaderResponses: Response[] = routeLoaderResults as Response[];
-
-  // Handle responses with a non-200 status code. The first loader with a
-  // non-200 status code determines the status code for the whole response.
-  let notOkResponse = [actionResponse, ...routeLoaderResponses].find(
-    response => response && response.status !== 200
-  );
-
-  let statusCode =
-    requestState === "no-match"
-      ? 404
-      : requestState === "invalid-request"
-      ? 405
-      : responseState === "error"
-      ? 500
-      : notOkResponse
-      ? notOkResponse.status
-      : 200;
-
-  let renderableMatches = getRenderableMatches(
-    matches,
-    componentDidCatchEmulator
-  );
-  let serverEntryModule = build.entry.module;
-  let headers = getDocumentHeaders(
-    build,
-    renderableMatches,
-    routeLoaderResponses,
-    actionResponse
-  );
-  let entryMatches = createEntryMatches(renderableMatches, build.assets.routes);
-  let routeData = await createRouteData(
-    renderableMatches,
-    routeLoaderResponses
-  );
-  let actionData =
-    actionResponse && actionRouteId
-      ? {
-          [actionRouteId]: await createActionData(actionResponse)
-        }
-      : undefined;
-  let routeModules = createEntryRouteModules(build.routes);
-  let serverHandoff = {
-    matches: entryMatches,
-    componentDidCatchEmulator,
-    routeData,
-    actionData
+  // Server UI state to send to the client.
+  // - When single fetch is enabled, this is streamed down via `serverHandoffStream`
+  // - Otherwise it's stringified into `serverHandoffString`
+  let state = {
+    loaderData: context.loaderData,
+    actionData: context.actionData,
+    errors: serializeErrors(context.errors, serverMode),
   };
   let entryContext: EntryContext = {
-    ...serverHandoff,
     manifest: build.assets,
-    routeModules,
-    serverHandoffString: createServerHandoffString(serverHandoff)
+    routeModules: createEntryRouteModules(build.routes),
+    staticHandlerContext: context,
+    criticalCss,
+    serverHandoffString: createServerHandoffString({
+      basename: build.basename,
+      criticalCss,
+      future: build.future,
+      isSpaMode: build.isSpaMode,
+      ...(!build.future.v3_singleFetch ? { state } : null),
+    }),
+    ...(build.future.v3_singleFetch
+      ? {
+          serverHandoffStream: encodeViaTurboStream(
+            state,
+            request.signal,
+            build.entry.module.streamTimeout,
+            serverMode
+          ),
+          renderMeta: {},
+        }
+      : null),
+    future: build.future,
+    isSpaMode: build.isSpaMode,
+    serializeError: (err) => serializeError(err, serverMode),
   };
 
-  let response: Response;
+  let handleDocumentRequestFunction = build.entry.module.default;
   try {
-    response = await serverEntryModule.default(
+    return await handleDocumentRequestFunction(
       request,
-      statusCode,
+      context.statusCode,
       headers,
-      entryContext
+      entryContext,
+      loadContext
     );
-  } catch (error: any) {
-    let formattedError = (await platform.formatServerError?.(error)) || error;
-    if (serverMode !== ServerMode.Test) {
-      console.error(formattedError);
+  } catch (error: unknown) {
+    handleError(error);
+
+    let errorForSecondRender = error;
+
+    // If they threw a response, unwrap it into an ErrorResponse like we would
+    // have for a loader/action
+    if (isResponse(error)) {
+      try {
+        let data = await unwrapResponse(error);
+        errorForSecondRender = new ErrorResponseImpl(
+          error.status,
+          error.statusText,
+          data
+        );
+      } catch (e) {
+        // If we can't unwrap the response - just leave it as-is
+      }
     }
 
-    statusCode = 500;
+    // Get a new StaticHandlerContext that contains the error at the right boundary
+    context = getStaticContextFromError(
+      staticHandler.dataRoutes,
+      context,
+      errorForSecondRender
+    );
 
-    // Go again, this time with the componentDidCatch emulation. As it rendered
-    // last time we mutated `componentDidCatch.routeId` for the last rendered
-    // route, now we know where to render the error boundary (feels a little
-    // hacky but that's how hooks work). This tells the emulator to stop
-    // tracking the `routeId` as we render because we already have an error to
-    // render.
-    componentDidCatchEmulator.trackBoundaries = false;
-    componentDidCatchEmulator.error = await serializeError(formattedError);
-    entryContext.serverHandoffString = createServerHandoffString(serverHandoff);
+    // Sanitize errors outside of development environments
+    if (context.errors) {
+      context.errors = sanitizeErrors(context.errors, serverMode);
+    }
+
+    // Get a new entryContext for the second render pass
+    // Server UI state to send to the client.
+    // - When single fetch is enabled, this is streamed down via `serverHandoffStream`
+    // - Otherwise it's stringified into `serverHandoffString`
+    let state = {
+      loaderData: context.loaderData,
+      actionData: context.actionData,
+      errors: serializeErrors(context.errors, serverMode),
+    };
+    entryContext = {
+      ...entryContext,
+      staticHandlerContext: context,
+      serverHandoffString: createServerHandoffString({
+        basename: build.basename,
+        future: build.future,
+        isSpaMode: build.isSpaMode,
+        ...(!build.future.v3_singleFetch ? { state } : null),
+      }),
+      ...(build.future.v3_singleFetch
+        ? {
+            serverHandoffStream: encodeViaTurboStream(
+              state,
+              request.signal,
+              build.entry.module.streamTimeout,
+              serverMode
+            ),
+            renderMeta: {},
+          }
+        : null),
+    };
 
     try {
-      response = await serverEntryModule.default(
+      return await handleDocumentRequestFunction(
         request,
-        statusCode,
+        context.statusCode,
         headers,
-        entryContext
+        entryContext,
+        loadContext
       );
     } catch (error: any) {
-      let formattedError = (await platform.formatServerError?.(error)) || error;
-      if (serverMode !== ServerMode.Test) {
-        console.error(formattedError);
-      }
+      handleError(error);
+      return returnLastResortErrorResponse(error, serverMode);
+    }
+  }
+}
 
-      // Good grief folks, get your act together 😂!
-      response = new Response(
-        `Unexpected Server Error\n\n${formattedError.message}`,
-        {
-          status: 500,
-          headers: {
-            "Content-Type": "text/plain"
-          }
-        }
+async function handleResourceRequest(
+  serverMode: ServerMode,
+  build: ServerBuild,
+  staticHandler: StaticHandler,
+  routeId: string,
+  request: Request,
+  loadContext: AppLoadContext,
+  handleError: (err: unknown) => void
+) {
+  try {
+    // Note we keep the routeId here to align with the Remix handling of
+    // resource routes which doesn't take ?index into account and just takes
+    // the leaf match
+    let response = await staticHandler.queryRoute(request, {
+      routeId,
+      requestContext: loadContext,
+    });
+
+    if (typeof response === "object" && response !== null) {
+      invariant(
+        !(DEFERRED_SYMBOL in response),
+        `You cannot return a \`defer()\` response from a Resource Route.  Did you ` +
+          `forget to export a default UI component from the "${routeId}" route?`
       );
     }
+
+    if (build.future.v3_singleFetch && !isResponse(response)) {
+      console.warn(
+        resourceRouteJsonWarning(
+          request.method === "GET" ? "loader" : "action",
+          routeId
+        )
+      );
+      response = json(response);
+    }
+
+    // callRouteLoader/callRouteAction always return responses (w/o single fetch).
+    // With single fetch, users should always be Responses from resource routes
+    invariant(
+      isResponse(response),
+      "Expected a Response to be returned from queryRoute"
+    );
+    return response;
+  } catch (error: unknown) {
+    if (isResponse(error)) {
+      // Note: Not functionally required but ensures that our response headers
+      // match identically to what Remix returns
+      let response = safelySetHeader(error, "X-Remix-Catch", "yes");
+      return response;
+    }
+
+    if (isRouteErrorResponse(error)) {
+      if (error) {
+        handleError(error);
+      }
+      return errorResponseToJson(error, serverMode);
+    }
+
+    handleError(error);
+    return returnLastResortErrorResponse(error, serverMode);
   }
-
-  return response;
 }
 
-function jsonError(error: string, status = 403): Response {
-  return json({ error }, { status });
-}
-
-function isActionRequest(request: Request): boolean {
-  let method = request.method.toLowerCase();
-  return (
-    method === "post" ||
-    method === "put" ||
-    method === "patch" ||
-    method === "delete"
+function errorResponseToJson(
+  errorResponse: ErrorResponse,
+  serverMode: ServerMode
+): Response {
+  return routerJson(
+    serializeError(
+      // @ts-expect-error This is "private" from users but intended for internal use
+      errorResponse.error || new Error("Unexpected Server Error"),
+      serverMode
+    ),
+    {
+      status: errorResponse.status,
+      statusText: errorResponse.statusText,
+      headers: {
+        "X-Remix-Error": "yes",
+      },
+    }
   );
 }
 
-function isValidRequestMethod(request: Request): boolean {
-  return (
-    request.method.toLowerCase() === "get" ||
-    isHeadRequest(request) ||
-    isActionRequest(request)
+function returnLastResortErrorResponse(error: any, serverMode?: ServerMode) {
+  let message = "Unexpected Server Error";
+
+  if (serverMode !== ServerMode.Production) {
+    message += `\n\n${String(error)}`;
+  }
+
+  // Good grief folks, get your act together 😂!
+  return new Response(message, {
+    status: 500,
+    headers: {
+      "Content-Type": "text/plain",
+    },
+  });
+}
+
+function unwrapResponse(response: Response) {
+  let contentType = response.headers.get("Content-Type");
+  // Check between word boundaries instead of startsWith() due to the last
+  // paragraph of https://httpwg.org/specs/rfc9110.html#field.content-type
+  return contentType && /\bapplication\/json\b/.test(contentType)
+    ? response.body == null
+      ? null
+      : response.json()
+    : response.text();
+}
+
+function createRemixRedirectResponse(
+  response: Response,
+  basename: string | undefined
+) {
+  // We don't have any way to prevent a fetch request from following
+  // redirects. So we use the `X-Remix-Redirect` header to indicate the
+  // next URL, and then "follow" the redirect manually on the client.
+  let headers = new Headers(response.headers);
+  let redirectUrl = headers.get("Location")!;
+  headers.set(
+    "X-Remix-Redirect",
+    basename ? stripBasename(redirectUrl, basename) || redirectUrl : redirectUrl
   );
-}
-
-function isHeadRequest(request: Request): boolean {
-  return request.method.toLowerCase() === "head";
-}
-
-function isDataRequest(request: Request): boolean {
-  return new URL(request.url).searchParams.has("_data");
-}
-
-function isIndexRequestUrl(url: URL) {
-  let indexRequest = false;
-
-  for (let param of url.searchParams.getAll("index")) {
-    if (!param) {
-      indexRequest = true;
-    }
+  headers.set("X-Remix-Status", String(response.status));
+  headers.delete("Location");
+  if (response.headers.get("Set-Cookie") !== null) {
+    headers.set("X-Remix-Revalidate", "yes");
   }
 
-  return indexRequest;
-}
-
-function stripIndexParam(request: Request) {
-  let url = new URL(request.url);
-  let indexValues = url.searchParams.getAll("index");
-  url.searchParams.delete("index");
-  let indexValuesToKeep = [];
-  for (let indexValue of indexValues) {
-    if (indexValue) {
-      indexValuesToKeep.push(indexValue);
-    }
-  }
-  for (let toKeep of indexValuesToKeep) {
-    url.searchParams.append("index", toKeep);
-  }
-
-  return new Request(url.toString(), request);
-}
-
-function stripDataParam(request: Request) {
-  let url = new URL(request.url);
-  url.searchParams.delete("_data");
-  return new Request(url.toString(), request);
-}
-
-// TODO: update to use key for lookup
-function getMatchesUpToDeepestBoundary(
-  matches: RouteMatch<ServerRoute>[],
-  key: "CatchBoundary" | "ErrorBoundary"
-) {
-  let deepestBoundaryIndex: number = -1;
-
-  matches.forEach((match, index) => {
-    if (match.route.module[key]) {
-      deepestBoundaryIndex = index;
-    }
+  return new Response(null, {
+    status: 204,
+    headers,
   });
-
-  if (deepestBoundaryIndex === -1) {
-    // no route error boundaries, don't need to call any loaders
-    return [];
-  }
-
-  return matches.slice(0, deepestBoundaryIndex + 1);
 }
 
-// This prevents `<Outlet/>` from rendering anything below where the error threw
-// TODO: maybe do this in <RemixErrorBoundary + context>
-function getRenderableMatches(
-  matches: RouteMatch<ServerRoute>[],
-  componentDidCatchEmulator: ComponentDidCatchEmulator
-) {
-  // no error, no worries
-  if (!componentDidCatchEmulator.catch && !componentDidCatchEmulator.error) {
-    return matches;
-  }
-
-  let lastRenderableIndex: number = -1;
-
-  matches.forEach((match, index) => {
-    let id = match.route.id;
-    if (
-      componentDidCatchEmulator.renderBoundaryRouteId === id ||
-      componentDidCatchEmulator.loaderBoundaryRouteId === id ||
-      componentDidCatchEmulator.catchBoundaryRouteId === id
-    ) {
-      lastRenderableIndex = index;
-    }
-  });
-
-  return matches.slice(0, lastRenderableIndex + 1);
+// Anytime we are setting a header on a `Response` created in the loader/action,
+// we have to so it in this manner since in an `undici` world, if the `Response`
+// came directly from a `fetch` call, the headers are immutable will throw if
+// we try to set a new header.  This is a sort of shallow clone of the `Response`
+// so we can safely set our own header.
+function safelySetHeader(
+  response: Response,
+  name: string,
+  value: string
+): Response {
+  let headers = new Headers(response.headers);
+  headers.set(name, value);
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+    duplex: response.body ? "half" : undefined,
+  } as ResponseInit & { duplex?: "half" });
 }

@@ -1,1 +1,3 @@
-Please see [our guide to contributing](docs/contributing.md).
+# Contributing
+
+Please see [our guide to contributing](docs/guides/contributing.md).
